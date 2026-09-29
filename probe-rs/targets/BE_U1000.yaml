@@ -1,0 +1,73 @@
+name: Baikal BE-U1000
+variants:
+- name: BE-U1000
+  cores:
+  - name: core0
+    type: riscv
+    core_access_options: !Riscv
+      hart_id: 0
+      # The chain is ordered from TDO to TDI: Core2, Core1, Core0.
+      jtag_tap: 2
+  jtag:
+    # The BE-U1000 IDCODE has a zero JEP106 manufacturer field, so automatic
+    # scan-chain validation rejects it. The physical chain is fixed on EVU-BA-2.5.
+    force_scan_chain: true
+    scan_chain:
+    - name: cpu2
+      ir_len: 5
+    - name: cpu1
+      ir_len: 5
+    - name: cpu0
+      ir_len: 5
+  memory_map:
+  - !Ram
+    name: Core 0 TCMA
+    range:
+      start: 0x40010000
+      end: 0x40020000
+    cores:
+    - core0
+    access:
+      boot: true
+  - !Ram
+    name: Core 0 TCMB
+    range:
+      start: 0x40020000
+      end: 0x40038000
+    cores:
+    - core0
+  - !Ram
+    name: Shared SRAM
+    range:
+      start: 0x70000000
+      end: 0x70008000
+    cores:
+    - core0
+  - !Nvm
+    name: Main eFlash
+    range:
+      start: 0xa0000000
+      end: 0xa0040000
+    cores:
+    - core0
+    access:
+      boot: true
+  flash_algorithms:
+  - be-u1000-main-eflash
+flash_algorithms:
+- name: be-u1000-main-eflash
+  description: Host-side programmer for the BE-U1000 main eFlash array
+  default: true
+  flash_properties:
+    address_range:
+      start: 0xa0000000
+      end: 0xa0040000
+    page_size: 0x100
+    erased_byte_value: 0xff
+    program_page_timeout: 1000
+    erase_sector_timeout: 10000
+    sectors:
+    - size: 0x400
+      address: 0x0
+  cores:
+  - core0

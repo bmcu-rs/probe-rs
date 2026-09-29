@@ -251,6 +251,7 @@ async fn run_embed(
         .map(|chip| chip.into());
 
     let probe_options = ProbeOptions {
+        board: None,
         chip,
         chip_description_path: None,
         protocol: config.probe.protocol,
@@ -440,7 +441,7 @@ async fn prepare_halted_image(
 ) -> Result<()> {
     if flashed {
         match boot_info {
-            BootInfo::FromRam { .. } => {
+            BootInfo::FromRam { .. } | BootInfo::Direct { .. } => {
                 session.prepare_boot(boot_info.clone(), core_id).await?;
             }
             BootInfo::Other => {

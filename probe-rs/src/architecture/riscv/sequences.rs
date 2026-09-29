@@ -94,6 +94,31 @@ pub trait RiscvDebugSequence: Send + Sync + Debug {
         None
     }
 
+    /// Return the address that should be used to start a loaded ELF image directly.
+    ///
+    /// Returning `Some` opts the target into target-specific boot handling for
+    /// ELF files which do not contain the conventional `.vector_table`
+    /// section. This can be used by targets whose debug boot mode waits for a
+    /// debugger, including when the image is executable directly from NVM.
+    /// The default keeps the existing reset-based behaviour.
+    fn direct_start_address(&self, _elf_entry_point: u64) -> Option<u64> {
+        None
+    }
+
+    /// Prepare a loaded image for direct execution at `start_address`.
+    ///
+    /// The default uses the existing RAM-start preparation. Targets which
+    /// need different handling for directly executable NVM images can
+    /// override this method.
+    fn prepare_running_direct(
+        &self,
+        session: &mut crate::Session,
+        start_address: u64,
+        core_id: usize,
+    ) -> Result<(), crate::Error> {
+        self.prepare_running_on_ram(session, start_address, core_id)
+    }
+
     /// This sequence is called if an image was flashed to RAM directly. It should perform the
     /// necessary preparation to run that image on the core with the ID passed to the function.
     ///

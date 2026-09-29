@@ -16,6 +16,7 @@ impl MonitorMode {
     pub fn should_clear_rtt_header(&self) -> bool {
         match self {
             MonitorMode::Run(BootInfo::FromRam { .. }) => true,
+            MonitorMode::Run(BootInfo::Direct { .. }) => true,
             MonitorMode::Run(BootInfo::Other) => true,
             MonitorMode::AttachToRunning => false,
         }

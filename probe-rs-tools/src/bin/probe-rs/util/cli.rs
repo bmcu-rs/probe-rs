@@ -61,6 +61,7 @@ pub async fn attach_probe(
     elf_meta: Option<ElfMetadata>,
     resume_target: bool,
 ) -> anyhow::Result<SessionInterface> {
+    probe_options.apply_board_profile();
     let elf_meta = elf_meta.unwrap_or_default();
 
     if let Some(elf_chip) = &elf_meta.chip
@@ -107,6 +108,7 @@ pub async fn attach_probe(
     }
 
     let result = with_slow_attach_feedback(client.attach_probe(AttachRequest {
+        board: probe_options.board,
         chip: probe_options.chip.or(elf_meta.chip),
         protocol: probe_options.protocol.map(to_wire_protocol),
         probe,

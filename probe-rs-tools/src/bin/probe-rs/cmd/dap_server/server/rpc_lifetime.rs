@@ -130,6 +130,7 @@ mod tests {
         );
 
         let options = ProbeOptions {
+            board: None,
             chip: Some(TEST_CHIP_NAME.to_owned()),
             chip_description_path: None,
             protocol: None,

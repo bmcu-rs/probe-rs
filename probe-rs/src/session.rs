@@ -842,6 +842,22 @@ impl Session {
         }
     }
 
+    /// Prepare an application which should be executed directly at the given address.
+    pub fn prepare_running_direct(
+        &mut self,
+        start_address: u64,
+        core_id: usize,
+    ) -> Result<(), crate::Error> {
+        match self.target.debug_sequence.clone() {
+            DebugSequence::Riscv(riscv_debug_sequence) => {
+                riscv_debug_sequence.prepare_running_direct(self, start_address, core_id)
+            }
+            DebugSequence::Arm(_) | DebugSequence::Xtensa(_) => Err(crate::Error::NotImplemented(
+                "direct image start on this architecture",
+            )),
+        }
+    }
+
     /// Check if the connected device has a debug erase sequence defined
     pub fn has_sequence_erase_all(&self) -> bool {
         match &self.target.debug_sequence {

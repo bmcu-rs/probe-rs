@@ -285,6 +285,14 @@ impl DebugSequence {
             DebugSequence::Xtensa(seq) => seq.debug_flash_sequence(),
         }
     }
+
+    /// Return a target-specific address for direct execution of a loaded ELF image.
+    pub(crate) fn direct_start_address(&self, elf_entry_point: u64) -> Option<u64> {
+        match self {
+            DebugSequence::Riscv(seq) => seq.direct_start_address(elf_entry_point),
+            DebugSequence::Arm(_) | DebugSequence::Xtensa(_) => None,
+        }
+    }
 }
 
 pub(crate) trait CoreExt {

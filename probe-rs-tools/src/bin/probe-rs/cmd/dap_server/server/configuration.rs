@@ -258,6 +258,7 @@ impl SessionConfig {
 
     pub(crate) fn probe_options(&self) -> ProbeOptions {
         ProbeOptions {
+            board: None,
             chip: self.chip.clone(),
             chip_description_path: self.chip_description_path.clone(),
             protocol: self.wire_protocol,

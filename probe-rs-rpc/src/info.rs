@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chip::{JEP106Code, MemoryRegion};
 use crate::core_ops::WireCoreType;
-use crate::probe::{DebugProbeEntry, WireProtocol};
+use crate::probe::{Board, DebugProbeEntry, WireProtocol};
 use crate::{Key, RpcResult, Session};
 
 /// Absolute flash sector range for GDB memory-map XML (`blocksize`).
@@ -38,6 +38,7 @@ pub struct TargetMetadataRequest {
 
 #[derive(Serialize, Deserialize, Schema)]
 pub struct TargetInfoRequest {
+    pub board: Option<Board>,
     pub probe: DebugProbeEntry,
     pub speed: Option<u32>,
     pub connect_under_reset: bool,

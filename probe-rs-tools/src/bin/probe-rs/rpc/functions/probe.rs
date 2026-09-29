@@ -377,6 +377,7 @@ mod tests {
 
         let result = client
             .attach_probe(AttachRequest {
+                board: None,
                 chip: Some(TEST_CHIP_NAME.to_owned()),
                 protocol: None,
                 probe,
@@ -545,6 +546,7 @@ pub(crate) mod convert {
     impl From<&AttachRequest> for ProbeOptions {
         fn from(request: &AttachRequest) -> Self {
             ProbeOptions {
+                board: request.board,
                 chip: request.chip.clone(),
                 chip_description_path: None,
                 protocol: request.protocol.map(from_wire_protocol),

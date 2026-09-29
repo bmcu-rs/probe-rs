@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::str::FromStr;
 
 use std::time::Duration;
 
@@ -6,6 +7,34 @@ use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 
 use crate::{Key, RpcResult, Session};
+
+/// A development board profile with probe-specific connection defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Schema)]
+pub enum Board {
+    /// Baikal Electronics EVU-BA-2.5 with its on-board FT2232H probe.
+    EvuBa2_5,
+}
+
+impl Display for Board {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EvuBa2_5 => f.write_str("evu-ba-2.5"),
+        }
+    }
+}
+
+impl FromStr for Board {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "evu-ba-2.5" => Ok(Self::EvuBa2_5),
+            _ => Err(format!(
+                "unknown board '{value}'; supported boards: evu-ba-2.5"
+            )),
+        }
+    }
+}
 
 // Separate from DebugProbeInfo because we can't serialize a &dyn ProbeFactory
 #[derive(Debug, Serialize, Deserialize, Clone, Schema)]
@@ -107,6 +136,7 @@ pub struct DebugProbeSelector {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Schema)]
 pub struct AttachRequest {
+    pub board: Option<Board>,
     pub chip: Option<String>,
     pub protocol: Option<WireProtocol>,
     pub probe: DebugProbeEntry,
@@ -119,3 +149,15 @@ pub struct AttachRequest {
 }
 
 pub type AttachResponse = RpcResult<AttachResult>;
+
+#[cfg(test)]
+mod tests {
+    use super::Board;
+
+    #[test]
+    fn board_name_round_trips() {
+        let board = "evu-ba-2.5".parse::<Board>().unwrap();
+        assert_eq!(board, Board::EvuBa2_5);
+        assert_eq!(board.to_string(), "evu-ba-2.5");
+    }
+}

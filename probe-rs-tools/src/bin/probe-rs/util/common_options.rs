@@ -14,9 +14,11 @@ use probe_rs::{
     probe::{
         DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeCreationError,
         WireProtocol,
+        ftdi::{FtdiJtagConfiguration, FtdiPinState, FtdiResetConfiguration, FtdiTdoSamplingEdge},
         list::{Accessibility, Lister},
     },
 };
+use probe_rs_rpc::probe::Board;
 use serde::{Deserialize, Serialize};
 
 /// How long to wait before another attempt at a probe that another process
@@ -126,6 +128,15 @@ pub struct ReadWriteOptions {
 /// Common options and logic when interfacing with a [Probe].
 #[derive(clap::Parser, Clone, Debug, Serialize, Deserialize)]
 pub struct ProbeOptions {
+    /// Apply connection defaults for a supported development board.
+    ///
+    /// Currently supported: `evu-ba-2.5`.
+    ///
+    /// Explicit `--chip`, `--probe`, `--protocol`, and `--speed` options take
+    /// precedence over the board profile.
+    #[arg(long, env = "PROBE_RS_BOARD", help_heading = "PROBE CONFIGURATION")]
+    pub board: Option<Board>,
+
     #[arg(long, env = "PROBE_RS_CHIP", help_heading = "PROBE CONFIGURATION")]
     pub chip: Option<String>,
     #[arg(
@@ -204,6 +215,40 @@ pub struct ProbeOptions {
 }
 
 impl ProbeOptions {
+    /// Fill unspecified connection options from the selected board profile.
+    ///
+    /// This is intentionally idempotent: CLI/RPC paths resolve the profile on
+    /// the client before probe selection and once more on the server before the
+    /// probe is opened.
+    pub(crate) fn apply_board_profile(&mut self) {
+        match self.board {
+            Some(Board::EvuBa2_5) => {
+                self.chip.get_or_insert_with(|| "BE-U1000".to_owned());
+                self.probe.get_or_insert_with(|| DebugProbeSelector {
+                    vendor_id: 0x0403,
+                    product_id: 0x6010,
+                    interface: Some(1),
+                    serial_number: None,
+                });
+                self.protocol.get_or_insert(WireProtocol::Jtag);
+                // This is a tested default, not a board-imposed limit. The
+                // FT2232H clock divisor yields an actual 7.5 MHz for this
+                // 8 MHz request. An explicit --speed always wins.
+                self.speed.get_or_insert(8_000);
+            }
+            None => {}
+        }
+    }
+
+    fn uses_evu_ba_2_5_onboard_probe(&self) -> bool {
+        matches!(self.board, Some(Board::EvuBa2_5))
+            && self.probe.as_ref().is_some_and(|selector| {
+                selector.vendor_id == 0x0403
+                    && selector.product_id == 0x6010
+                    && selector.interface == Some(1)
+            })
+    }
+
     pub fn load(self, registry: &mut Registry) -> Result<LoadedProbeOptions<'_>, OperationError> {
         LoadedProbeOptions::new(self, registry)
     }
@@ -232,9 +277,10 @@ impl<'r> LoadedProbeOptions<'r> {
     /// Performs necessary init calls such as loading all chip descriptions
     /// and returns a newtype that ensures initialization.
     pub(crate) fn new(
-        probe_options: ProbeOptions,
+        mut probe_options: ProbeOptions,
         registry: &'r mut Registry,
     ) -> Result<Self, OperationError> {
+        probe_options.apply_board_profile();
         let mut options = Self(probe_options, registry);
         // Load the target description, if given in the cli parameters.
         options.maybe_load_chip_desc()?;
@@ -333,6 +379,22 @@ impl<'r> LoadedProbeOptions<'r> {
         let start = Instant::now();
 
         loop {
+            // A board profile intentionally avoids baking a machine-specific
+            // serial number into its defaults. Do not let the FTDI factory pick
+            // an arbitrary device when more than one matching EVU probe is
+            // connected; the user can make the selection unambiguous with an
+            // explicit `--probe 0403:6010-1:<serial>` selector.
+            if self.0.uses_evu_ba_2_5_onboard_probe()
+                && self.0.probe.as_ref().is_some_and(|selector| {
+                    selector.serial_number.as_ref().is_none_or(String::is_empty)
+                })
+            {
+                let list = lister.list(self.0.probe.as_ref());
+                if list.len() > 1 {
+                    return Err(OperationError::MultipleProbesFound { list });
+                }
+            }
+
             // If we got a probe selector as an argument, open the probe
             // matching the selector if possible.
             let error = match &self.0.probe {
@@ -364,6 +426,35 @@ impl<'r> LoadedProbeOptions<'r> {
         } else {
             self.open_probe(lister)?
         };
+
+        if !self.0.dry_run && self.0.uses_evu_ba_2_5_onboard_probe() {
+            Probe::try_into::<probe_rs::probe::ftdi::FtdiProbe>(&mut probe)
+                .ok_or_else(|| {
+                    DebugProbeError::Other(
+                        "the EVU-BA-2.5 on-board probe profile requires the FTDI driver".into(),
+                    )
+                })?
+                .set_jtag_configuration(FtdiJtagConfiguration {
+                    // ADBUS4 = nTRST, ADBUS5 = nSRST, both deasserted high.
+                    initial_pins: FtdiPinState {
+                        output: 0x0038,
+                        direction: 0x003b,
+                    },
+                    tdo_sampling_edge: FtdiTdoSamplingEdge::Falling,
+                    reset: Some(FtdiResetConfiguration {
+                        asserted_pins: FtdiPinState {
+                            output: 0x0008,
+                            direction: 0x003b,
+                        },
+                        deasserted_pins: FtdiPinState {
+                            output: 0x0038,
+                            direction: 0x003b,
+                        },
+                        assert_duration: Duration::from_millis(100),
+                        post_deassert_delay: Duration::from_millis(500),
+                    }),
+                });
+        }
 
         if let Some(protocol) = self.0.protocol {
             // Select protocol and speed
@@ -719,6 +810,37 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AmbiguousBoardLister;
+
+    impl probe_rs::integration::ProbeLister for AmbiguousBoardLister {
+        fn open(&self, _selector: &DebugProbeSelector) -> Result<Probe, DebugProbeError> {
+            Ok(Probe::from_specific_probe(Box::new(
+                FakeProbe::with_mocked_core(),
+            )))
+        }
+
+        fn list_with_access(
+            &self,
+            _selector: Option<&DebugProbeSelector>,
+        ) -> Vec<probe_rs::probe::list::ProbeListItem> {
+            ["evu-one", "evu-two"]
+                .into_iter()
+                .map(|serial| {
+                    probe_rs::probe::list::ProbeListItem::accessible(DebugProbeInfo::new(
+                        "EVU-BA-2.5 FTDI",
+                        0x0403,
+                        0x6010,
+                        Some(serial.to_owned()),
+                        &MockProbeFactory,
+                        None,
+                        false,
+                    ))
+                })
+                .collect()
+        }
+    }
+
     impl std::fmt::Debug for BusyLister {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("BusyLister")
@@ -805,6 +927,7 @@ mod tests {
 
     fn probe_options(attach_timeout: Option<Duration>) -> ProbeOptions {
         ProbeOptions {
+            board: None,
             chip: None,
             chip_description_path: None,
             protocol: None,
@@ -817,6 +940,92 @@ mod tests {
             allow_erase_all: false,
             attach_timeout,
         }
+    }
+
+    #[test]
+    fn evu_ba_2_5_profile_fills_unspecified_connection_options() {
+        let mut options = probe_options(None);
+        options.board = Some(Board::EvuBa2_5);
+
+        options.apply_board_profile();
+
+        assert_eq!(options.chip.as_deref(), Some("BE-U1000"));
+        assert_eq!(options.protocol, Some(WireProtocol::Jtag));
+        assert_eq!(options.speed, Some(8_000));
+        assert_eq!(
+            options.probe,
+            Some(DebugProbeSelector {
+                vendor_id: 0x0403,
+                product_id: 0x6010,
+                interface: Some(1),
+                serial_number: None,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_connection_options_override_evu_ba_2_5_profile() {
+        let explicit_probe = DebugProbeSelector {
+            vendor_id: 0x1366,
+            product_id: 0x0105,
+            interface: None,
+            serial_number: Some("external-probe".to_owned()),
+        };
+        let mut options = probe_options(None);
+        options.board = Some(Board::EvuBa2_5);
+        options.chip = Some("explicit-chip".to_owned());
+        options.probe = Some(explicit_probe.clone());
+        options.protocol = Some(WireProtocol::Swd);
+        options.speed = Some(1_234);
+
+        options.apply_board_profile();
+
+        assert_eq!(options.chip.as_deref(), Some("explicit-chip"));
+        assert_eq!(options.probe, Some(explicit_probe));
+        assert_eq!(options.protocol, Some(WireProtocol::Swd));
+        assert_eq!(options.speed, Some(1_234));
+        assert!(!options.uses_evu_ba_2_5_onboard_probe());
+    }
+
+    #[test]
+    fn board_name_is_accepted_by_clap() {
+        use clap::Parser;
+
+        let options = ProbeOptions::try_parse_from(["probe-rs", "--board", "evu-ba-2.5"])
+            .expect("known board should parse");
+
+        assert_eq!(options.board, Some(Board::EvuBa2_5));
+    }
+
+    #[test]
+    fn evu_ba_2_5_profile_rejects_ambiguous_onboard_probes() {
+        let handle = Lister::with_lister(Box::new(AmbiguousBoardLister));
+        let mut registry = Registry::from_builtin_families();
+        let mut options = probe_options(None);
+        options.board = Some(Board::EvuBa2_5);
+        let options = options.load(&mut registry).unwrap();
+
+        assert!(matches!(
+            options.attach_probe(&handle),
+            Err(OperationError::MultipleProbesFound { list }) if list.len() == 2
+        ));
+    }
+
+    #[test]
+    fn evu_ba_2_5_profile_allows_an_explicit_probe_serial() {
+        let handle = Lister::with_lister(Box::new(AmbiguousBoardLister));
+        let mut registry = Registry::from_builtin_families();
+        let mut options = probe_options(None);
+        options.board = Some(Board::EvuBa2_5);
+        options.probe = Some(DebugProbeSelector {
+            vendor_id: 0x0403,
+            product_id: 0x6010,
+            interface: Some(1),
+            serial_number: Some("evu-one".to_owned()),
+        });
+        let options = options.load(&mut registry).unwrap();
+
+        assert!(options.open_probe(&handle).is_ok());
     }
 
     /// `--attach-timeout` must also work for the commands that attach directly

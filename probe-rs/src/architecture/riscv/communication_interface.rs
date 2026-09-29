@@ -3067,6 +3067,23 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
     /// Perform a reset of all harts on the target and halt them at the first instruction.
     pub fn reset_hart_and_halt(&mut self, timeout: Duration) -> Result<(), RiscvError> {
+        self.reset_hart_and_halt_impl(timeout, true)
+    }
+
+    /// Perform a reset and halt on targets which do not implement the optional
+    /// `havereset` status bits.
+    pub(crate) fn reset_hart_and_halt_allow_missing_havereset(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), RiscvError> {
+        self.reset_hart_and_halt_impl(timeout, false)
+    }
+
+    fn reset_hart_and_halt_impl(
+        &mut self,
+        timeout: Duration,
+        require_havereset: bool,
+    ) -> Result<(), RiscvError> {
         tracing::debug!("Resetting core, setting hartreset bit");
 
         let mut dmcontrol = self.state.current_dmcontrol;
@@ -3123,7 +3140,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
                 continue;
             }
 
-            if readback.allhavereset() && readback.allhalted() {
+            if readback.allhalted() && (!require_havereset || readback.allhavereset()) {
                 break;
             }
 

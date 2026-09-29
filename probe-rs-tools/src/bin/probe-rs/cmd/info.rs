@@ -60,7 +60,9 @@ fn parse_hex(src: &str) -> Result<u32, ParseIntError> {
 }
 
 impl Cmd {
-    pub async fn run(self, client: RpcClient) -> anyhow::Result<()> {
+    pub async fn run(mut self, client: RpcClient) -> anyhow::Result<()> {
+        self.common.apply_board_profile();
+
         if self.verbose {
             let protocols = if let Some(protocol) = self.common.protocol {
                 vec![protocol]
@@ -87,6 +89,7 @@ impl Cmd {
                 let mut errors = vec![];
 
                 let req = TargetInfoRequest {
+                    board: self.common.board,
                     target_sel: self.target_sel,
                     protocol: to_wire_protocol(protocol),
 

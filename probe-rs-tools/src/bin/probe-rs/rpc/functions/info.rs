@@ -776,6 +776,7 @@ pub(crate) mod convert {
     impl From<&TargetInfoRequest> for ProbeOptions {
         fn from(request: &TargetInfoRequest) -> Self {
             ProbeOptions {
+                board: request.board,
                 chip: None,
                 chip_description_path: None,
                 protocol: match request.protocol {

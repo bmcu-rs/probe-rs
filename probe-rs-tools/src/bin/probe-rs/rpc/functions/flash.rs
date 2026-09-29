@@ -44,6 +44,9 @@ pub fn prepare_boot_info(
         } => {
             session.prepare_running_on_ram(vector_table_addr, core_id)?;
         }
+        flashing::BootInfo::Direct { start_address, .. } => {
+            session.prepare_running_direct(start_address, core_id)?;
+        }
         flashing::BootInfo::Other => {
             session
                 .core(core_id)?
@@ -365,6 +368,13 @@ pub(crate) mod convert {
                 vector_table_addr,
                 cores_to_reset,
             },
+            probe_rs::flashing::BootInfo::Direct {
+                start_address,
+                cores_to_reset,
+            } => BootInfo::Direct {
+                start_address,
+                cores_to_reset,
+            },
             probe_rs::flashing::BootInfo::Other => BootInfo::Other,
         }
     }
@@ -376,6 +386,13 @@ pub(crate) mod convert {
                 cores_to_reset,
             } => probe_rs::flashing::BootInfo::FromRam {
                 vector_table_addr: *vector_table_addr,
+                cores_to_reset: cores_to_reset.clone(),
+            },
+            BootInfo::Direct {
+                start_address,
+                cores_to_reset,
+            } => probe_rs::flashing::BootInfo::Direct {
+                start_address: *start_address,
                 cores_to_reset: cores_to_reset.clone(),
             },
             BootInfo::Other => probe_rs::flashing::BootInfo::Other,

@@ -167,6 +167,10 @@ pub enum BootInfo {
         vector_table_addr: u64,
         cores_to_reset: Vec<String>,
     },
+    Direct {
+        start_address: u64,
+        cores_to_reset: Vec<String>,
+    },
     Other,
 }
 

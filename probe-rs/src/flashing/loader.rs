@@ -407,7 +407,7 @@ mod builtin {
         fn load(
             &self,
             flash_loader: &mut FlashLoader,
-            _session: &mut Session,
+            session: &mut Session,
             file: &mut dyn ImageReader,
         ) -> Result<(), FileDownloadError> {
             const VECTOR_TABLE_SECTION_NAME: &str = ".vector_table";
@@ -438,6 +438,20 @@ mod builtin {
                     section.data.len(),
                     if section.data.len() == 1 { "" } else { "s" }
                 );
+            }
+
+            if flash_loader.vector_table_addr().is_none() {
+                let binary = object::File::parse(&*elf_buffer)?;
+                if let Some(start_address) = session
+                    .target()
+                    .debug_sequence
+                    .direct_start_address(binary.entry())
+                {
+                    tracing::info!(
+                        "Using target-specific direct start address {start_address:#010x}"
+                    );
+                    flash_loader.set_direct_start_addr(start_address);
+                }
             }
 
             for data in extracted_data {
@@ -665,6 +679,13 @@ pub enum BootInfo {
         /// All cores that should be reset and halted before any RAM access
         cores_to_reset: Vec<String>,
     },
+    /// Loaded executable should be started directly through the target debug sequence.
+    Direct {
+        /// Address at which execution should start.
+        start_address: u64,
+        /// All cores that should be reset and halted before loading completes.
+        cores_to_reset: Vec<String>,
+    },
     /// Executable is either not loaded yet or will be booted conventionally (from flash etc.)
     #[default]
     Other,
@@ -686,6 +707,9 @@ pub struct FlashLoader {
     /// Relevant for manually configured RAM booted executables, available only if given loader supports it
     vector_table_addr: Option<u64>,
 
+    /// Target-specific address at which a loaded ELF should be started directly.
+    direct_start_addr: Option<u64>,
+
     read_flasher_rtt: bool,
 }
 
@@ -697,6 +721,7 @@ impl FlashLoader {
             builder: FlashBuilder::new(),
             source,
             vector_table_addr: None,
+            direct_start_addr: None,
             read_flasher_rtt: false,
         }
     }
@@ -722,8 +747,27 @@ impl FlashLoader {
         self.vector_table_addr = Some(vector_table_addr);
     }
 
+    /// Set a target-specific address at which the loaded image should start directly.
+    pub fn set_direct_start_addr(&mut self, start_address: u64) {
+        self.direct_start_addr = Some(start_address);
+    }
+
     /// Retrieve available boot information
     pub fn boot_info(&self) -> BootInfo {
+        if let Some(start_address) = self.direct_start_addr {
+            return match Self::get_region_for_address(&self.memory_map, start_address) {
+                Some(MemoryRegion::Ram(region)) => BootInfo::FromRam {
+                    vector_table_addr: start_address,
+                    cores_to_reset: region.cores.clone(),
+                },
+                Some(MemoryRegion::Nvm(region)) => BootInfo::Direct {
+                    start_address,
+                    cores_to_reset: region.cores.clone(),
+                },
+                _ => BootInfo::Other,
+            };
+        }
+
         let Some(vector_table_addr) = self.vector_table_addr else {
             return BootInfo::Other;
         };
@@ -912,12 +956,19 @@ impl FlashLoader {
 
         tracing::debug!("Committing RAM!");
 
-        if let BootInfo::FromRam { cores_to_reset, .. } = self.boot_info() {
-            // If we are booting from RAM, it might be important to reset and halt before the RAM
-            // image is written below, to guarantee a clear state. Normally, flash algorithm
-            // loader performs reset and halt - does not happen here. Some targets are expected to
-            // already be reset by other tooling before RAM flashing runs, in which case the
-            // target description disables this reset and the core is only halted.
+        let cores_to_reset = match self.boot_info() {
+            BootInfo::FromRam { cores_to_reset, .. } | BootInfo::Direct { cores_to_reset, .. } => {
+                Some(cores_to_reset)
+            }
+            BootInfo::Other => None,
+        };
+
+        if let Some(cores_to_reset) = cores_to_reset {
+            // A directly started image can include RAM data, so reset and halt before RAM is
+            // written below to guarantee a clear state. Normally a flash algorithm loader does
+            // this, but RAM-only downloads do not use one. Some targets are expected to already
+            // be reset by other tooling, in which case the target description disables this
+            // reset and the core is only halted.
             let skip_reset_on_ram_boot = session.target().skip_reset_on_ram_boot;
             for (core_to_reset_index, _) in session
                 .target()
@@ -931,13 +982,11 @@ impl FlashLoader {
                     .core(core_to_reset_index)
                     .and_then(|mut core| {
                         if skip_reset_on_ram_boot {
-                            tracing::debug!(
-                                " -- action: vector table in RAM, assuming RAM boot, halting"
-                            );
+                            tracing::debug!(" -- action: direct image start, halting");
                             core.halt(Duration::from_millis(500))
                         } else {
                             tracing::debug!(
-                                " -- action: vector table in RAM, assuming RAM boot, resetting and halting"
+                                " -- action: direct image start, resetting and halting"
                             );
                             core.reset_and_halt(Duration::from_millis(500))
                         }
@@ -1355,5 +1404,92 @@ impl FlashLoader {
             .data
             .iter()
             .map(|(address, data)| (*address, data.as_slice()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_rs_target::RamRegion;
+
+    use super::*;
+
+    fn direct_start_test_loader() -> FlashLoader {
+        FlashLoader::new(
+            vec![
+                MemoryRegion::Ram(RamRegion {
+                    name: Some("TCMA".into()),
+                    range: 0x4001_0000..0x4002_0000,
+                    cores: vec!["core0".into()],
+                    is_alias: false,
+                    access: None,
+                }),
+                MemoryRegion::Nvm(NvmRegion {
+                    name: Some("Main eFlash".into()),
+                    range: 0xa000_0000..0xa004_0000,
+                    cores: vec!["core0".into()],
+                    is_alias: false,
+                    access: None,
+                }),
+            ],
+            TargetDescriptionSource::BuiltIn,
+        )
+    }
+
+    #[test]
+    fn direct_start_in_ram_is_classified_as_ram_boot() {
+        let mut loader = direct_start_test_loader();
+        loader.set_direct_start_addr(0x4001_0030);
+
+        match loader.boot_info() {
+            BootInfo::FromRam {
+                vector_table_addr,
+                cores_to_reset,
+            } => {
+                assert_eq!(vector_table_addr, 0x4001_0030);
+                assert_eq!(cores_to_reset, ["core0"]);
+            }
+            other => panic!("expected RAM boot information, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_start_in_nvm_is_classified_as_direct_boot() {
+        let mut loader = direct_start_test_loader();
+        loader.set_direct_start_addr(0xa000_0030);
+
+        match loader.boot_info() {
+            BootInfo::Direct {
+                start_address,
+                cores_to_reset,
+            } => {
+                assert_eq!(start_address, 0xa000_0030);
+                assert_eq!(cores_to_reset, ["core0"]);
+            }
+            other => panic!("expected direct boot information, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_start_outside_known_memory_is_not_bootable() {
+        let mut loader = direct_start_test_loader();
+        loader.set_direct_start_addr(0x2000_0000);
+
+        assert!(matches!(loader.boot_info(), BootInfo::Other));
+    }
+
+    #[test]
+    fn load_address_keeps_ram_and_main_eflash_programming_disjoint() {
+        let mut ram_loader = direct_start_test_loader();
+        ram_loader.add_data(0x4001_0000, &[1, 2, 3, 4]).unwrap();
+        assert!(ram_loader.has_data_for_address(0x4001_0000));
+        assert!(!ram_loader.has_data_for_address(0xa000_0000));
+
+        let mut eflash_loader = direct_start_test_loader();
+        eflash_loader.add_data(0xa000_0000, &[1, 2, 3, 4]).unwrap();
+        assert!(eflash_loader.has_data_for_address(0xa000_0000));
+        assert!(!eflash_loader.has_data_for_address(0x4001_0000));
+
+        assert!(eflash_loader.add_data(0xa003_fffe, &[1, 2, 3, 4]).is_err());
+        assert!(eflash_loader.add_data(0xa004_0000, &[1]).is_err());
     }
 }
