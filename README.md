@@ -71,6 +71,13 @@ The probe-rs website includes [VSCode configuration instructions](https://probe.
 
 ## Usage Examples
 
+### Baikal BE-U1000 and EVU-BA-2.5
+
+The built-in BE-U1000 target and `evu-ba-2.5` board profile cover the board's
+on-board FTDI JTAG adapter, Core 0, and main eFlash. See the
+[target and board notes](doc/baikal-be-u1000.md) for wiring, flashing safety,
+and GDB commands.
+
 ### Using a Linux host as an SWD probe
 
 On Linux, probe-rs can drive SWD directly from the host through the
