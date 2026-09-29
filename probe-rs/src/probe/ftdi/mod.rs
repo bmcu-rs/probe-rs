@@ -26,6 +26,7 @@ use nusb::{DeviceInfo, MaybeFuture};
 use std::{
     io::{Read, Write},
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -36,6 +37,49 @@ use crate::probe::Batch;
 
 use command_compacter::Command;
 use ftdaye::{ChipType, error::FtdiError};
+
+/// The clock edge on which an FTDI MPSSE adapter samples JTAG TDO.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FtdiTdoSamplingEdge {
+    /// Sample TDO on the rising edge of TCK.
+    #[default]
+    Rising,
+    /// Sample TDO on the falling edge of TCK.
+    Falling,
+}
+
+/// Output levels and direction masks for the FTDI low and high GPIO bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FtdiPinState {
+    /// Output levels passed to the MPSSE `SET_BITS` commands.
+    pub output: u16,
+    /// Pin direction mask, where a set bit configures the pin as an output.
+    pub direction: u16,
+}
+
+/// Pin states and delays used to reset a target through FTDI GPIOs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FtdiResetConfiguration {
+    /// Pin state used while target reset is asserted.
+    pub asserted_pins: FtdiPinState,
+    /// Pin state used after target reset is deasserted.
+    pub deasserted_pins: FtdiPinState,
+    /// Time to keep reset asserted in [`DebugProbe::target_reset`].
+    pub assert_duration: Duration,
+    /// Time to wait after reset is deasserted in [`DebugProbe::target_reset`].
+    pub post_deassert_delay: Duration,
+}
+
+/// Board-specific JTAG wiring configuration for a generic FTDI probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FtdiJtagConfiguration {
+    /// Pin state applied when the FTDI MPSSE is attached.
+    pub initial_pins: FtdiPinState,
+    /// Edge on which TDO is sampled.
+    pub tdo_sampling_edge: FtdiTdoSamplingEdge,
+    /// Optional target-reset wiring and timing.
+    pub reset: Option<FtdiResetConfiguration>,
+}
 
 #[derive(Debug)]
 struct JtagAdapter {
@@ -48,6 +92,7 @@ struct JtagAdapter {
     in_bit_counts: Vec<usize>,
     in_bits: BitVec,
     ftdi: FtdiProperties,
+    jtag_configuration: Option<FtdiJtagConfiguration>,
 }
 
 impl JtagAdapter {
@@ -93,7 +138,13 @@ impl JtagAdapter {
             in_bit_counts: vec![],
             in_bits: BitVec::new(),
             ftdi,
+            jtag_configuration: None,
         })
+    }
+
+    fn set_jtag_configuration(&mut self, configuration: FtdiJtagConfiguration) {
+        self.jtag_configuration = Some(configuration);
+        tracing::info!(?configuration, "Using custom FTDI JTAG configuration");
     }
 
     pub fn attach(&mut self) -> Result<(), FtdiError> {
@@ -117,6 +168,13 @@ impl JtagAdapter {
     }
 
     fn pin_layout(&self) -> (u16, u16) {
+        if let Some(configuration) = self.jtag_configuration {
+            return (
+                configuration.initial_pins.output,
+                configuration.initial_pins.direction,
+            );
+        }
+
         let (output, direction) = match (
             self.device.vendor_id(),
             self.device.product_id(),
@@ -136,6 +194,27 @@ impl JtagAdapter {
             _ => (0x0008, 0x000b),
         };
         (output, direction)
+    }
+
+    fn set_pins(&mut self, pins: FtdiPinState) -> Result<(), DebugProbeError> {
+        self.flush()?;
+        self.device.set_pins(pins.output, pins.direction)?;
+        Ok(())
+    }
+
+    fn reset_configuration(&self) -> Result<FtdiResetConfiguration, DebugProbeError> {
+        self.jtag_configuration
+            .and_then(|configuration| configuration.reset)
+            .ok_or(DebugProbeError::NotImplemented {
+                function_name: "target_reset",
+            })
+    }
+
+    fn tdo_sampling_edge(&self) -> FtdiTdoSamplingEdge {
+        self.jtag_configuration
+            .map_or(FtdiTdoSamplingEdge::Rising, |configuration| {
+                configuration.tdo_sampling_edge
+            })
     }
 
     fn speed_khz(&self) -> u32 {
@@ -237,7 +316,8 @@ impl JtagAdapter {
         }
 
         command.add_captured_bits(&mut self.in_bit_counts);
-        command.encode(&mut self.commands);
+        let tdo_sampling_edge = self.tdo_sampling_edge();
+        command.encode_with_tdo_edge(&mut self.commands, tdo_sampling_edge);
 
         Ok(())
     }
@@ -445,6 +525,15 @@ pub struct FtdiProbe {
     swd_settings: SwdSettings,
 }
 
+impl FtdiProbe {
+    /// Override the default FTDI JTAG pin layout and signal timing.
+    ///
+    /// This must be called before the probe is attached.
+    pub fn set_jtag_configuration(&mut self, configuration: FtdiJtagConfiguration) {
+        self.adapter.set_jtag_configuration(configuration);
+    }
+}
+
 impl DebugProbe for FtdiProbe {
     fn get_name(&self) -> &str {
         "FTDI"
@@ -470,23 +559,26 @@ impl DebugProbe for FtdiProbe {
     }
 
     fn target_reset(&mut self) -> Result<(), DebugProbeError> {
-        // TODO we could add this by using a GPIO. However, different probes may connect
-        // different pins (if any) to the reset line, so we would need to make this configurable.
-        Err(DebugProbeError::NotImplemented {
-            function_name: "target_reset",
-        })
+        let reset = self.adapter.reset_configuration()?;
+        self.target_reset_assert()?;
+        thread::sleep(reset.assert_duration);
+        self.target_reset_deassert()?;
+        thread::sleep(reset.post_deassert_delay);
+        Ok(())
     }
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "target_reset_assert",
-        })
+        let reset = self.adapter.reset_configuration()?;
+        self.adapter.set_pins(reset.asserted_pins)?;
+        self.jtag_state.tap_state = TapState::TestLogicReset;
+        Ok(())
     }
 
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
-        Err(DebugProbeError::NotImplemented {
-            function_name: "target_reset_deassert",
-        })
+        let reset = self.adapter.reset_configuration()?;
+        self.adapter.set_pins(reset.deasserted_pins)?;
+        self.jtag_state.tap_state = TapState::TestLogicReset;
+        Ok(())
     }
 
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {

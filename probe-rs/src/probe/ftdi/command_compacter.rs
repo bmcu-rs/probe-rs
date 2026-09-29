@@ -1,5 +1,7 @@
 use crate::probe::BitSequence;
 
+use super::FtdiTdoSamplingEdge;
+
 #[derive(Clone, Debug, Default)]
 pub enum Command {
     /// No command should be output.
@@ -121,8 +123,19 @@ impl Command {
         }
     }
 
-    /// Appends the command to the given buffer.
+    /// Appends the command to the given buffer, sampling TDO on the rising edge.
+    #[cfg(test)]
     pub fn encode(&self, out: &mut Vec<u8>) {
+        self.encode_with_tdo_edge(out, FtdiTdoSamplingEdge::Rising);
+    }
+
+    /// Appends the command to the given buffer with the selected TDO sample edge.
+    pub(crate) fn encode_with_tdo_edge(
+        &self,
+        out: &mut Vec<u8>,
+        tdo_sampling_edge: FtdiTdoSamplingEdge,
+    ) {
+        let read_on_negative_edge = matches!(tdo_sampling_edge, FtdiTdoSamplingEdge::Falling);
         match self {
             Self::None => {}
             Self::TmsBits {
@@ -132,7 +145,11 @@ impl Command {
                 bit_count,
             } => {
                 let tms_byte = tms_bits | ((*tdi as u8) << 7);
-                let cap_bit = if *capture { 0x20 } else { 0 };
+                let cap_bit = if *capture {
+                    0x20 | if read_on_negative_edge { 0x04 } else { 0 }
+                } else {
+                    0
+                };
 
                 out.extend_from_slice(&[0x4b | cap_bit, *bit_count as u8 - 1, tms_byte]);
             }
@@ -143,7 +160,11 @@ impl Command {
                 bit_count,
                 ..
             } => {
-                let cap_bit = if *capture { 0x20 } else { 0 };
+                let cap_bit = if *capture {
+                    0x20 | if read_on_negative_edge { 0x04 } else { 0 }
+                } else {
+                    0
+                };
 
                 let mut tdi_bits = *tdi_bits;
                 let mut bit_count = *bit_count as u8;
@@ -165,7 +186,11 @@ impl Command {
                 bit_count,
                 ..
             } => {
-                let cap_bit = if *capture { 0x20 } else { 0 };
+                let cap_bit = if *capture {
+                    0x20 | if read_on_negative_edge { 0x04 } else { 0 }
+                } else {
+                    0
+                };
 
                 let [n_low, n_high] = (tdi_bytes.len() as u16 - 1).to_le_bytes();
                 out.extend_from_slice(&[0x19 | cap_bit, n_low, n_high]);
@@ -316,7 +341,7 @@ pub(crate) mod decoder {
             }
 
             let capture = opcode & 0x20 != 0;
-            match opcode & 0xdf {
+            match opcode & 0xdb {
                 0x4b => {
                     let bit_count = bytes[index + 1] as usize + 1;
                     let tms_byte = bytes[index + 2];
@@ -349,5 +374,67 @@ pub(crate) mod decoder {
             }
         }
         triples
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, FtdiTdoSamplingEdge, decoder::decode_commands_full};
+
+    #[test]
+    fn falling_edge_capture_sets_mpsse_read_neg() {
+        let commands = [
+            Command::TmsBits {
+                bit_count: 1,
+                tms_bits: 1,
+                tdi: false,
+                capture: true,
+            },
+            Command::TdiBits {
+                bit_count: 1,
+                tdi_bits: 1,
+                capture: true,
+            },
+            Command::TdiSequence {
+                tdi_bytes: vec![0x5a],
+                bit_count: 0,
+                tdi_bits: 0,
+                capture: true,
+            },
+        ];
+
+        let mut rising = Vec::new();
+        let mut falling = Vec::new();
+        for command in commands {
+            command.encode_with_tdo_edge(&mut rising, FtdiTdoSamplingEdge::Rising);
+            command.encode_with_tdo_edge(&mut falling, FtdiTdoSamplingEdge::Falling);
+        }
+
+        assert_eq!(
+            rising,
+            [0x6b, 0x00, 0x01, 0x3b, 0x00, 0x01, 0x39, 0x00, 0x00, 0x5a]
+        );
+        assert_eq!(
+            falling,
+            [0x6f, 0x00, 0x01, 0x3f, 0x00, 0x01, 0x3d, 0x00, 0x00, 0x5a]
+        );
+        assert_eq!(
+            decode_commands_full(&rising),
+            decode_commands_full(&falling)
+        );
+    }
+
+    #[test]
+    fn sample_edge_does_not_change_write_only_commands() {
+        let command = Command::TdiBits {
+            bit_count: 1,
+            tdi_bits: 1,
+            capture: false,
+        };
+        let mut rising = Vec::new();
+        let mut falling = Vec::new();
+        command.encode_with_tdo_edge(&mut rising, FtdiTdoSamplingEdge::Rising);
+        command.encode_with_tdo_edge(&mut falling, FtdiTdoSamplingEdge::Falling);
+        assert_eq!(rising, falling);
     }
 }
