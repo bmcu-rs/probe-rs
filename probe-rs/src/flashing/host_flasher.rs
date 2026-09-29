@@ -36,9 +36,17 @@ fn region_flash_props(
         .cloned()
         .unwrap_or_else(|| algo_props.sectors[0]);
 
+    // A few host-side algorithms describe multiple logical regions with one
+    // global page size. Keep pages inside the scoped region (and its sector),
+    // while preserving smaller pages used by targets such as BE-U1000.
+    let region_size = region_range.end.saturating_sub(region_range.start);
+    let page_size = u64::from(algo_props.page_size)
+        .min(sector.size)
+        .min(region_size) as u32;
+
     FlashProperties {
         address_range: region_range.clone(),
-        page_size: sector.size as u32,
+        page_size,
         erased_byte_value: algo_props.erased_byte_value,
         program_page_timeout: algo_props.program_page_timeout,
         erase_sector_timeout: algo_props.erase_sector_timeout,
@@ -336,5 +344,64 @@ impl HostSideFlasher {
         }
 
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_props_clamp_cc27_scfg_page_to_its_one_kibibyte_region() {
+        let properties = FlashProperties {
+            address_range: 0x0000_0000..0x4e04_0400,
+            page_size: 0x800,
+            erased_byte_value: 0xff,
+            program_page_timeout: 1_000,
+            erase_sector_timeout: 2_000,
+            sectors: vec![
+                SectorDescription {
+                    size: 0x800,
+                    address: 0,
+                },
+                SectorDescription {
+                    size: 0x400,
+                    address: 0x4e04_0000,
+                },
+            ],
+        };
+
+        let region_properties = region_flash_props(&properties, &(0x4e04_0000..0x4e04_0400));
+
+        assert_eq!(region_properties.address_range, 0x4e04_0000..0x4e04_0400);
+        assert_eq!(region_properties.page_size, 0x400);
+        assert_eq!(
+            region_properties.sectors,
+            vec![SectorDescription {
+                size: 0x400,
+                address: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn region_props_preserve_be_u1000_pages_smaller_than_sectors() {
+        let properties = FlashProperties {
+            address_range: 0xa000_0000..0xa004_0000,
+            page_size: 0x100,
+            erased_byte_value: 0xff,
+            program_page_timeout: 1_000,
+            erase_sector_timeout: 10_000,
+            sectors: vec![SectorDescription {
+                size: 0x400,
+                address: 0,
+            }],
+        };
+
+        let region_properties = region_flash_props(&properties, &(0xa000_0000..0xa004_0000));
+
+        assert_eq!(region_properties.address_range, 0xa000_0000..0xa004_0000);
+        assert_eq!(region_properties.page_size, 0x100);
+        assert_eq!(region_properties.sectors[0].size, 0x400);
     }
 }
